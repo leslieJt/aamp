@@ -6,6 +6,12 @@ on:
   schedule:
     - cron: "0 1 * * *"
   workflow_dispatch:
+  # Path filter so edits to this workflow can start a run immediately
+  # (useful when bot tokens lack actions:write for workflow_dispatch).
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/daily-build.yml"
 
 concurrency:
   group: daily-build-${{ github.ref }}
