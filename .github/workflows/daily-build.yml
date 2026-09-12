@@ -1,0 +1,93 @@
+# Daily project build at 09:00 Asia/Shanghai (UTC+8, no DST).
+# GitHub Actions cron is UTC-only, so 09:00 Shanghai == 01:00 UTC.
+name: Daily build
+
+on:
+  schedule:
+    - cron: "0 1 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: daily-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  node-packages:
+    name: Node packages
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Matches CONTRIBUTING.md local checks: build all Node packages; test the Node SDK.
+          - path: packages/sdks/nodejs
+            test: true
+          - path: packages/aamp-cli
+            test: false
+          - path: packages/aamp-openclaw-plugin
+            test: false
+          - path: packages/aamp-acp-bridge
+            test: false
+          - path: packages/aamp-cli-bridge
+            test: false
+          - path: packages/aamp-wechat-bridge
+            test: false
+          - path: packages/aamp-feishu-bridge
+            test: false
+    defaults:
+      run:
+        working-directory: ${{ matrix.path }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: ${{ matrix.path }}/package-lock.json
+
+      - name: Install
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Test
+        if: matrix.test
+        run: npm test
+
+  go-sdk:
+    name: Go SDK
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: packages/sdks/go
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.21"
+          cache-dependency-path: packages/sdks/go/go.sum
+
+      - name: Test
+        run: go test ./...
+
+  python-sdk:
+    name: Python SDK
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: packages/sdks/python
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install
+        run: python -m pip install -e .
+
+      - name: Test
+        run: python -m unittest discover -s tests -v
