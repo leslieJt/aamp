@@ -28,21 +28,25 @@ jobs:
           # Matches CONTRIBUTING.md local checks: build all Node packages; test the Node SDK.
           - path: packages/sdks/nodejs
             test: true
+            needs_sdk: false
           - path: packages/aamp-cli
             test: false
+            needs_sdk: true
           - path: packages/aamp-openclaw-plugin
             test: false
+            needs_sdk: true
           - path: packages/aamp-acp-bridge
             test: false
+            needs_sdk: true
           - path: packages/aamp-cli-bridge
             test: false
+            needs_sdk: true
           - path: packages/aamp-wechat-bridge
             test: false
+            needs_sdk: true
           - path: packages/aamp-feishu-bridge
             test: false
-    defaults:
-      run:
-        working-directory: ${{ matrix.path }}
+            needs_sdk: true
     steps:
       - uses: actions/checkout@v4
 
@@ -50,16 +54,29 @@ jobs:
         with:
           node-version: "20"
           cache: npm
-          cache-dependency-path: ${{ matrix.path }}/package-lock.json
+          cache-dependency-path: |
+            packages/sdks/nodejs/package-lock.json
+            ${{ matrix.path }}/package-lock.json
+
+      # file:../sdks/nodejs packages need a built SDK (dist/ + types) before tsc.
+      - name: Build aamp-sdk dependency
+        if: matrix.needs_sdk
+        working-directory: packages/sdks/nodejs
+        run: |
+          npm ci
+          npm run build
 
       - name: Install
+        working-directory: ${{ matrix.path }}
         run: npm ci
 
       - name: Build
+        working-directory: ${{ matrix.path }}
         run: npm run build
 
       - name: Test
         if: matrix.test
+        working-directory: ${{ matrix.path }}
         run: npm test
 
   go-sdk:
