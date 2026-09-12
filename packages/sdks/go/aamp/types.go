@@ -3,24 +3,26 @@ package aamp
 import "time"
 
 type Config struct {
-	Email              string
-	MailboxToken       string
-	BaseURL            string
-	HTTPSendBaseURL    string
-	SMTPHost           string
-	SMTPPort           int
-	SMTPPassword       string
-	ReconnectInterval  time.Duration
-	RejectUnauthorized bool
+	Email                        string
+	MailboxToken                 string
+	BaseURL                      string
+	HTTPSendBaseURL              string
+	SMTPHost                     string
+	SMTPPort                     int
+	SMTPPassword                 string
+	ReconnectInterval            time.Duration
+	RejectUnauthorized           bool
+	StreamAppendSequenceTimeout  time.Duration
 }
 
 type MailboxIdentityConfig struct {
-	Email              string
-	SMTPPassword       string
-	BaseURL            string
-	SMTPPort           int
-	ReconnectInterval  time.Duration
-	RejectUnauthorized bool
+	Email                       string
+	SMTPPassword                string
+	BaseURL                     string
+	SMTPPort                    int
+	ReconnectInterval           time.Duration
+	RejectUnauthorized          bool
+	StreamAppendSequenceTimeout time.Duration
 }
 
 type RegisterMailboxOptions struct {
@@ -102,6 +104,7 @@ type SendTaskOptions struct {
 	BodyText        string
 	Priority        string
 	ExpiresAt       string
+	SessionKey      string
 	DispatchContext map[string]string
 	ParentTaskID    string
 	Attachments     []Attachment
@@ -150,6 +153,21 @@ type SendCardResponseOptions struct {
 	InReplyTo string
 }
 
+type SendPairRequestOptions struct {
+	To                   string
+	TaskID               string
+	PairCode             string
+	DispatchContextRules map[string][]string
+}
+
+type SendPairRespondOptions struct {
+	To        string
+	TaskID    string
+	Success   bool
+	Reason    string
+	InReplyTo string
+}
+
 type CreateStreamOptions struct {
 	TaskID    string `json:"taskId"`
 	PeerEmail string `json:"peerEmail"`
@@ -180,6 +198,13 @@ type AppendStreamEventOptions struct {
 	StreamID string         `json:"streamId"`
 	Type     string         `json:"type"`
 	Payload  map[string]any `json:"payload"`
+	// Sequence is a client-side ordering hint for concurrent appends.
+	// When set, appends are dispatched strictly by sequence order.
+	// Concurrent callers must pass unique contiguous sequences.
+	// Duplicate or already-dispatched sequences return an error.
+	// Missing sequences fail pending waiters after StreamAppendSequenceTimeout.
+	// When nil, the SDK assigns a monotonic sequence at enqueue time.
+	Sequence *int `json:"-"`
 }
 
 type CloseStreamOptions struct {
@@ -226,31 +251,35 @@ type EmailMetadata struct {
 }
 
 type ParsedMessage struct {
-	ProtocolVersion  string
-	Intent           string
-	TaskID           string
-	Title            string
-	Priority         string
-	ExpiresAt        string
-	DispatchContext  map[string]string
-	ParentTaskID     string
-	From             string
-	To               string
-	MessageID        string
-	Subject          string
-	BodyText         string
-	InReplyTo        string
-	References       []string
-	Status           string
-	Output           string
-	ErrorMsg         string
-	StructuredResult any
-	Question         string
-	BlockedReason    string
-	SuggestedOptions []string
-	StreamID         string
-	Summary          string
-	Attachments      []ReceivedAttachment
+	ProtocolVersion      string
+	Intent               string
+	TaskID               string
+	Title                string
+	Priority             string
+	ExpiresAt            string
+	SessionKey           string
+	DispatchContext      map[string]string
+	DispatchContextRules map[string][]string
+	ParentTaskID         string
+	From                 string
+	To                   string
+	MessageID            string
+	Subject              string
+	BodyText             string
+	InReplyTo            string
+	References           []string
+	Status               string
+	Success              bool
+	Output               string
+	ErrorMsg             string
+	StructuredResult     any
+	Question             string
+	BlockedReason        string
+	SuggestedOptions     []string
+	StreamID             string
+	Summary              string
+	PairCode             string
+	Attachments          []ReceivedAttachment
 }
 
 type ReceivedAttachment struct {

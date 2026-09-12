@@ -1,3 +1,26 @@
-node_modules
-dist
-__pycache__
+# Dependencies
+node_modules/
+
+# Build outputs
+dist/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Environment & secrets
+.env
+.env.*
+
+# IDE / Editors
+.idea/
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+
+# OS
+.DS_Store
+Thumbs.db

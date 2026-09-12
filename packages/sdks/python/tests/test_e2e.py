@@ -468,43 +468,32 @@ class EndToEndTests(unittest.TestCase):
         )
 
         tokens = [chr(code) for code in range(ord("A"), ord("Z") + 1)]
-        threads: list[threading.Thread] = []
+        start_barrier = threading.Barrier(len(tokens))
+        errors: list[BaseException] = []
 
-        first_token = tokens[0]
-        first_thread = threading.Thread(
-            target=lambda: client.append_stream_event(
-                stream_id=stream["streamId"],
-                event_type="text.delta",
-                payload={"text": first_token},
-            )
-        )
-        threads.append(first_thread)
-        first_thread.start()
-        time.sleep(0.01)
-
-        release_events: list[threading.Event] = []
-        for token in tokens[1:]:
-            release = threading.Event()
-            release_events.append(release)
-            thread = threading.Thread(
-                target=lambda gate=release, value=token: (
-                    gate.wait(),
-                    client.append_stream_event(
-                        stream_id=stream["streamId"],
-                        event_type="text.delta",
-                        payload={"text": value},
-                    ),
+        def append_token(sequence: int, token: str) -> None:
+            try:
+                start_barrier.wait(timeout=2)
+                client.append_stream_event(
+                    stream_id=stream["streamId"],
+                    event_type="text.delta",
+                    payload={"text": token},
+                    sequence=sequence,
                 )
-            )
-            threads.append(thread)
-            thread.start()
+            except BaseException as err:  # pragma: no cover - surfaced via errors list
+                errors.append(err)
 
-        for release in release_events:
-            release.set()
-            time.sleep(0.002)
-
+        threads = [
+            threading.Thread(target=append_token, args=(index, token))
+            for index, token in enumerate(tokens)
+        ]
         for thread in threads:
-            thread.join(timeout=2)
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=5)
+
+        if errors:
+            raise errors[0]
 
         events = list(self.mock_state.streams[stream["streamId"]]["events"])
         self.assertGreaterEqual(len(events), 1)
@@ -513,6 +502,153 @@ class EndToEndTests(unittest.TestCase):
             "".join(str(event["payload"].get("text", "")) for event in events),
             "".join(tokens),
         )
+
+    def test_stream_append_dispatches_by_explicit_sequence_out_of_enqueue_order(self) -> None:
+        client = AampClient.from_mailbox_identity(
+            email="agent@mesh.local",
+            smtp_password="agent-pass",
+            base_url=self.base_url,
+            reconnect_interval=0.1,
+            reject_unauthorized=False,
+        )
+
+        stream = client.create_stream(
+            task_id="task-stream-explicit-sequence",
+            peer_email="dispatcher@mesh.local",
+        )
+
+        tokens = [chr(code) for code in range(ord("A"), ord("Z") + 1)]
+        start_barrier = threading.Barrier(len(tokens))
+        errors: list[BaseException] = []
+
+        def append_token(sequence: int, token: str) -> None:
+            try:
+                start_barrier.wait(timeout=2)
+                client.append_stream_event(
+                    stream_id=stream["streamId"],
+                    event_type="text.delta",
+                    payload={"text": token},
+                    sequence=sequence,
+                )
+            except BaseException as err:  # pragma: no cover - surfaced via errors list
+                errors.append(err)
+
+        threads = [
+            threading.Thread(target=append_token, args=(index, tokens[index]))
+            for index in reversed(range(len(tokens)))
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=5)
+
+        if errors:
+            raise errors[0]
+
+        events = list(self.mock_state.streams[stream["streamId"]]["events"])
+        self.assertGreaterEqual(len(events), 1)
+        self.assertLess(len(events), len(tokens))
+        self.assertEqual(
+            "".join(str(event["payload"].get("text", "")) for event in events),
+            "".join(tokens),
+        )
+
+    def test_stream_append_rejects_duplicate_sequence(self) -> None:
+        client = AampClient.from_mailbox_identity(
+            email="agent@mesh.local",
+            smtp_password="agent-pass",
+            base_url=self.base_url,
+            reconnect_interval=0.1,
+            reject_unauthorized=False,
+        )
+        stream = client.create_stream(
+            task_id="task-stream-duplicate-sequence",
+            peer_email="dispatcher@mesh.local",
+        )
+
+        client.append_stream_event(
+            stream_id=stream["streamId"],
+            event_type="text.delta",
+            payload={"text": "A"},
+            sequence=0,
+        )
+        with self.assertRaises(ValueError) as ctx:
+            client.append_stream_event(
+                stream_id=stream["streamId"],
+                event_type="text.delta",
+                payload={"text": "A2"},
+                sequence=0,
+            )
+        self.assertIn("duplicate", str(ctx.exception))
+
+        started = threading.Event()
+        errors: list[BaseException] = []
+
+        def hold_sequence_two() -> None:
+            try:
+                started.set()
+                client.append_stream_event(
+                    stream_id=stream["streamId"],
+                    event_type="text.delta",
+                    payload={"text": "C"},
+                    sequence=2,
+                )
+            except BaseException as err:  # pragma: no cover
+                errors.append(err)
+
+        holder = threading.Thread(target=hold_sequence_two)
+        holder.start()
+        self.assertTrue(started.wait(timeout=2))
+        time.sleep(0.05)
+        with self.assertRaises(ValueError) as pending_ctx:
+            client.append_stream_event(
+                stream_id=stream["streamId"],
+                event_type="text.delta",
+                payload={"text": "C2"},
+                sequence=2,
+            )
+        self.assertIn("duplicate", str(pending_ctx.exception))
+
+        client.append_stream_event(
+            stream_id=stream["streamId"],
+            event_type="text.delta",
+            payload={"text": "B"},
+            sequence=1,
+        )
+        holder.join(timeout=2)
+        if errors:
+            raise errors[0]
+
+    def test_stream_append_times_out_on_missing_sequence(self) -> None:
+        client = AampClient.from_mailbox_identity(
+            email="agent@mesh.local",
+            smtp_password="agent-pass",
+            base_url=self.base_url,
+            reconnect_interval=0.1,
+            reject_unauthorized=False,
+            stream_append_sequence_timeout=0.1,
+        )
+        stream = client.create_stream(
+            task_id="task-stream-missing-sequence",
+            peer_email="dispatcher@mesh.local",
+        )
+
+        with self.assertRaises(TimeoutError) as ctx:
+            client.append_stream_event(
+                stream_id=stream["streamId"],
+                event_type="text.delta",
+                payload={"text": "B"},
+                sequence=1,
+            )
+        self.assertIn("waiting for stream append sequence 0", str(ctx.exception))
+
+        result = client.append_stream_event(
+            stream_id=stream["streamId"],
+            event_type="text.delta",
+            payload={"text": "A"},
+            sequence=0,
+        )
+        self.assertIn("id", result)
 
 
 if __name__ == "__main__":

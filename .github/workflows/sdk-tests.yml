@@ -1,0 +1,64 @@
+name: SDK Tests
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'packages/sdks/**'
+      - '.github/workflows/sdk-tests.yml'
+  pull_request:
+    paths:
+      - 'packages/sdks/**'
+      - '.github/workflows/sdk-tests.yml'
+
+concurrency:
+  group: sdk-tests-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  nodejs:
+    name: Node.js SDK
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: packages/sdks/nodejs
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: packages/sdks/nodejs/package-lock.json
+      - run: npm ci
+      - run: npm test
+
+  python:
+    name: Python SDK
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: packages/sdks/python
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: packages/sdks/python/pyproject.toml
+      - run: pip install -e .
+      - run: python -m unittest discover -s tests -v
+
+  go:
+    name: Go SDK
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: packages/sdks/go
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+          cache-dependency-path: packages/sdks/go/go.sum
+      - run: go test ./...

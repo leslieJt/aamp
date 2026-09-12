@@ -1,0 +1,197 @@
+{
+  "schemaVersion": "1.0",
+  "cases": [
+    {
+      "name": "minimal task dispatch",
+      "input": {
+        "from": "<dispatcher@example.com>",
+        "to": "<agent@example.com>",
+        "messageId": "<dispatch-min@example.com>",
+        "subject": "[AAMP Task] Review patch",
+        "bodyText": "",
+        "headers": {
+          "x-aamp-intent": "task.dispatch",
+          "x-aamp-taskid": "task-min-1"
+        }
+      },
+      "expected": {
+        "protocolVersion": "1.1",
+        "intent": "task.dispatch",
+        "taskId": "task-min-1",
+        "title": "Review patch",
+        "priority": "normal",
+        "from": "dispatcher@example.com",
+        "to": "agent@example.com",
+        "messageId": "<dispatch-min@example.com>",
+        "subject": "[AAMP Task] Review patch",
+        "bodyText": ""
+      }
+    },
+    {
+      "name": "dispatch with session and context",
+      "input": {
+        "from": "dispatcher@example.com",
+        "to": "agent@example.com",
+        "messageId": "<dispatch-context@example.com>",
+        "subject": "[AAMP Task] Continue rollout",
+        "bodyText": "",
+        "headers": {
+          "X-AAMP-Version": "1.1",
+          "X-AAMP-Intent": "task.dispatch",
+          "X-AAMP-TaskId": "task-context-1",
+          "X-AAMP-Priority": "high",
+          "X-AAMP-Expires-At": "2026-08-01T12:00:00.000Z",
+          "X-AAMP-Session-Key": "rollout-thread-42",
+          "X-AAMP-Dispatch-Context": "project_key=proj%20123; source=feishu",
+          "X-AAMP-ParentTaskId": "task-parent-1"
+        }
+      },
+      "expected": {
+        "protocolVersion": "1.1",
+        "intent": "task.dispatch",
+        "taskId": "task-context-1",
+        "title": "Continue rollout",
+        "priority": "high",
+        "expiresAt": "2026-08-01T12:00:00.000Z",
+        "sessionKey": "rollout-thread-42",
+        "dispatchContext": {
+          "project_key": "proj 123",
+          "source": "feishu"
+        },
+        "parentTaskId": "task-parent-1",
+        "from": "dispatcher@example.com",
+        "to": "agent@example.com",
+        "messageId": "<dispatch-context@example.com>",
+        "subject": "[AAMP Task] Continue rollout",
+        "bodyText": ""
+      }
+    },
+    {
+      "name": "pair request with dispatch context rules",
+      "input": {
+        "from": "requester@example.com",
+        "to": "agent@example.com",
+        "messageId": "<pair-request@example.com>",
+        "subject": "[AAMP Pair] Connection request",
+        "bodyText": "",
+        "headers": {
+          "X-AAMP-Version": "1.1",
+          "X-AAMP-Intent": "pair.request",
+          "X-AAMP-TaskId": "pair-request-1",
+          "X-AAMP-Pair-Code": "7r8g5A2k",
+          "X-AAMP-Dispatch-Context-Rules": "eyJzb3VyY2UiOlsiZmVpc2h1IiwiZ2l0aHViIl19"
+        }
+      },
+      "expected": {
+        "protocolVersion": "1.1",
+        "intent": "pair.request",
+        "taskId": "pair-request-1",
+        "pairCode": "7r8g5A2k",
+        "dispatchContextRules": {
+          "source": [
+            "feishu",
+            "github"
+          ]
+        },
+        "from": "requester@example.com",
+        "to": "agent@example.com",
+        "messageId": "<pair-request@example.com>",
+        "subject": "[AAMP Pair] Connection request",
+        "bodyText": ""
+      }
+    },
+    {
+      "name": "rejected pair response",
+      "input": {
+        "from": "agent@example.com",
+        "to": "requester@example.com",
+        "messageId": "<pair-response@example.com>",
+        "subject": "[AAMP Pair] rejected",
+        "bodyText": "AAMP Pair Response",
+        "headers": {
+          "X-AAMP-Version": "1.1",
+          "X-AAMP-Intent": "pair.respond",
+          "X-AAMP-TaskId": "pair-request-1",
+          "X-AAMP-Status": "rejected",
+          "X-AAMP-ErrorMsg": "invalid or expired pair code"
+        }
+      },
+      "expected": {
+        "protocolVersion": "1.1",
+        "intent": "pair.respond",
+        "taskId": "pair-request-1",
+        "status": "rejected",
+        "success": false,
+        "reason": "invalid or expired pair code",
+        "from": "agent@example.com",
+        "to": "requester@example.com",
+        "messageId": "<pair-response@example.com>",
+        "subject": "[AAMP Pair] rejected",
+        "bodyText": "AAMP Pair Response"
+      }
+    },
+    {
+      "name": "task result with structured result",
+      "input": {
+        "from": "agent@example.com",
+        "to": "dispatcher@example.com",
+        "messageId": "<task-result@example.com>",
+        "subject": "[AAMP Result] Task task-result-1 - completed",
+        "bodyText": "Output:\ndone",
+        "headers": {
+          "X-AAMP-Version": "1.1",
+          "X-AAMP-Intent": "task.result",
+          "X-AAMP-TaskId": "task-result-1",
+          "X-AAMP-Status": "completed",
+          "X-AAMP-StructuredResult": "W3siZmllbGRLZXkiOiJzdW1tYXJ5IiwiZmllbGRUeXBlS2V5IjoidGV4dCIsInZhbHVlIjoiZG9uZSJ9XQ"
+        }
+      },
+      "expected": {
+        "protocolVersion": "1.1",
+        "intent": "task.result",
+        "taskId": "task-result-1",
+        "status": "completed",
+        "output": "done",
+        "structuredResult": [
+          {
+            "fieldKey": "summary",
+            "fieldTypeKey": "text",
+            "value": "done"
+          }
+        ],
+        "from": "agent@example.com",
+        "to": "dispatcher@example.com",
+        "messageId": "<task-result@example.com>"
+      }
+    },
+    {
+      "name": "task help request",
+      "input": {
+        "from": "agent@example.com",
+        "to": "dispatcher@example.com",
+        "messageId": "<task-help@example.com>",
+        "subject": "[AAMP Help] Task task-help-1 needs assistance",
+        "bodyText": "Question: Which database should I use?\nBlocked reason: The schema is not specified.\nSuggested options:\n  1. PostgreSQL\n  2. MySQL",
+        "headers": {
+          "X-AAMP-Version": "1.1",
+          "X-AAMP-Intent": "task.help_needed",
+          "X-AAMP-TaskId": "task-help-1"
+        }
+      },
+      "expected": {
+        "protocolVersion": "1.1",
+        "intent": "task.help_needed",
+        "taskId": "task-help-1",
+        "question": "Which database should I use?",
+        "blockedReason": "The schema is not specified.",
+        "suggestedOptions": [
+          "PostgreSQL",
+          "MySQL"
+        ],
+        "from": "agent@example.com",
+        "to": "dispatcher@example.com",
+        "messageId": "<task-help@example.com>"
+      }
+    }
+  ]
+}

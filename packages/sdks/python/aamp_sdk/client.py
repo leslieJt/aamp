@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import base64
+import heapq
 import json
 import ssl
 import threading
+import time
 from typing import Any
 from urllib.parse import urlencode, urljoin
 from urllib.request import Request, urlopen
@@ -15,10 +17,19 @@ from .jmap_push import JmapPushClient
 from .smtp import SmtpSender, derive_mailbox_service_defaults
 
 DEFAULT_HTTP_TIMEOUT_SECS = 30
+DEFAULT_STREAM_APPEND_SEQUENCE_TIMEOUT_SECS = 30.0
 
 
 class _StreamAppendOperation:
-    def __init__(self, *, event_type: str, payload: dict[str, Any], text: str | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        sequence: int,
+        event_type: str,
+        payload: dict[str, Any],
+        text: str | None = None,
+    ) -> None:
+        self.sequence = sequence
         self.event_type = event_type
         self.payload = dict(payload)
         self.text = text
@@ -31,7 +42,12 @@ class _StreamAppendQueue:
     def __init__(self) -> None:
         self.condition = threading.Condition()
         self.running = False
-        self.operations: list[_StreamAppendOperation] = []
+        self.operations: list[tuple[int, int, _StreamAppendOperation]] = []
+        self.reserved_sequences: set[int] = set()
+        self.next_auto_sequence = 0
+        self.next_dispatch_sequence = 0
+        self._tiebreaker = 0
+        self.gap_wait_started_at: float | None = None
 
 
 def _ssl_context(reject_unauthorized: bool) -> ssl.SSLContext:
@@ -51,12 +67,14 @@ class AampClient(TinyEmitter):
         smtp_port: int = 587,
         reconnect_interval: float = 5.0,
         reject_unauthorized: bool = True,
+        stream_append_sequence_timeout: float = DEFAULT_STREAM_APPEND_SEQUENCE_TIMEOUT_SECS,
     ) -> None:
         super().__init__()
         self.email = email
         self.mailbox_token = mailbox_token
         self.base_url = base_url
         self.reject_unauthorized = reject_unauthorized
+        self._stream_append_sequence_timeout = float(stream_append_sequence_timeout)
         self._stream_append_queues: dict[str, _StreamAppendQueue] = {}
         self._stream_append_queues_guard = threading.RLock()
 
@@ -88,6 +106,8 @@ class AampClient(TinyEmitter):
             "task.help_needed",
             "task.ack",
             "task.stream.opened",
+            "pair.request",
+            "pair.respond",
             "card.query",
             "card.response",
             "reply",
@@ -124,6 +144,7 @@ class AampClient(TinyEmitter):
         smtp_port: int = 587,
         reconnect_interval: float = 5.0,
         reject_unauthorized: bool = True,
+        stream_append_sequence_timeout: float = DEFAULT_STREAM_APPEND_SEQUENCE_TIMEOUT_SECS,
     ) -> "AampClient":
         derived = derive_mailbox_service_defaults(email, base_url)
         token = base64.b64encode(f"{email}:{smtp_password}".encode("utf-8")).decode("ascii")
@@ -136,6 +157,7 @@ class AampClient(TinyEmitter):
             smtp_port=smtp_port,
             reconnect_interval=reconnect_interval,
             reject_unauthorized=reject_unauthorized,
+            stream_append_sequence_timeout=stream_append_sequence_timeout,
         )
 
     @staticmethod
@@ -272,6 +294,12 @@ class AampClient(TinyEmitter):
     def send_card_response(self, **kwargs: Any) -> None:
         self.smtp_sender.send_card_response(**kwargs)
 
+    def send_pair_request(self, **kwargs: Any) -> tuple[str, str]:
+        return self.smtp_sender.send_pair_request(**kwargs)
+
+    def send_pair_respond(self, **kwargs: Any) -> None:
+        self.smtp_sender.send_pair_respond(**kwargs)
+
     def download_blob(self, blob_id: str, filename: str | None = None) -> bytes:
         return self.jmap_client.download_blob(blob_id, filename)
 
@@ -372,18 +400,66 @@ class AampClient(TinyEmitter):
             reject_unauthorized=self.reject_unauthorized,
         )
 
+    def _fail_pending_stream_append_operations(self, queue: _StreamAppendQueue, error: Exception) -> None:
+        pending = [operation for _, _, operation in queue.operations]
+        queue.operations.clear()
+        for operation in pending:
+            queue.reserved_sequences.discard(operation.sequence)
+            operation.error = error
+            operation.done = True
+        queue.gap_wait_started_at = None
+        queue.running = False
+        queue.condition.notify_all()
+
+    def _coalesce_pending_text_delta_operations(
+        self, queue: _StreamAppendQueue, operation: _StreamAppendOperation
+    ) -> list[_StreamAppendOperation]:
+        merged = [operation]
+        if operation.event_type != "text.delta" or operation.text is None:
+            return merged
+
+        while queue.operations:
+            next_sequence, _, next_operation = queue.operations[0]
+            if next_operation.event_type != "text.delta" or next_operation.text is None:
+                break
+            if next_sequence != operation.sequence + len(merged):
+                break
+            heapq.heappop(queue.operations)
+            operation.text += next_operation.text
+            merged.append(next_operation)
+        return merged
+
     def _drain_stream_append_queue(self, stream_id: str) -> None:
         queue = self._get_stream_append_queue(stream_id)
         while True:
             with queue.condition:
                 if not queue.operations:
                     queue.running = False
+                    queue.gap_wait_started_at = None
                     queue.condition.notify_all()
-                    with self._stream_append_queues_guard:
-                        if not queue.running and not queue.operations:
-                            self._stream_append_queues.pop(stream_id, None)
                     return
-                operation = queue.operations.pop(0)
+                if queue.operations[0][0] != queue.next_dispatch_sequence:
+                    now = time.monotonic()
+                    if queue.gap_wait_started_at is None:
+                        queue.gap_wait_started_at = now
+                    remaining = self._stream_append_sequence_timeout - (now - queue.gap_wait_started_at)
+                    if remaining <= 0:
+                        missing = queue.next_dispatch_sequence
+                        pending_min = queue.operations[0][0]
+                        self._fail_pending_stream_append_operations(
+                            queue,
+                            TimeoutError(
+                                f"timed out after {self._stream_append_sequence_timeout:.3f}s waiting for "
+                                f"stream append sequence {missing} on stream {stream_id}; "
+                                f"lowest pending sequence is {pending_min}"
+                            ),
+                        )
+                        return
+                    queue.condition.wait(timeout=remaining)
+                    continue
+                queue.gap_wait_started_at = None
+                _, _, operation = heapq.heappop(queue.operations)
+                merged_operations = self._coalesce_pending_text_delta_operations(queue, operation)
 
             try:
                 payload = dict(operation.payload)
@@ -395,13 +471,19 @@ class AampClient(TinyEmitter):
                     payload=payload,
                 )
                 with queue.condition:
-                    operation.result = result
-                    operation.done = True
+                    queue.next_dispatch_sequence += len(merged_operations)
+                    for merged_operation in merged_operations:
+                        queue.reserved_sequences.discard(merged_operation.sequence)
+                        merged_operation.result = result
+                        merged_operation.done = True
                     queue.condition.notify_all()
             except Exception as err:  # pragma: no cover - exercised via callers
                 with queue.condition:
-                    operation.error = err
-                    operation.done = True
+                    queue.next_dispatch_sequence += len(merged_operations)
+                    for merged_operation in merged_operations:
+                        queue.reserved_sequences.discard(merged_operation.sequence)
+                        merged_operation.error = err
+                        merged_operation.done = True
                     queue.condition.notify_all()
 
     def _flush_stream_append_queue(self, stream_id: str) -> None:
@@ -410,29 +492,46 @@ class AampClient(TinyEmitter):
             while queue.running or queue.operations:
                 queue.condition.wait()
 
-    def append_stream_event(self, *, stream_id: str, event_type: str, payload: dict[str, Any]) -> dict[str, Any]:
+    def append_stream_event(
+        self,
+        *,
+        stream_id: str,
+        event_type: str,
+        payload: dict[str, Any],
+        sequence: int | None = None,
+    ) -> dict[str, Any]:
         queue = self._get_stream_append_queue(stream_id)
         with queue.condition:
-            operation: _StreamAppendOperation
-            if event_type == "text.delta" and isinstance(payload.get("text"), str):
-                last_operation = queue.operations[-1] if queue.operations else None
-                if (
-                    last_operation is not None
-                    and last_operation.event_type == "text.delta"
-                    and last_operation.text is not None
-                ):
-                    last_operation.text += str(payload.get("text") or "")
-                    operation = last_operation
-                else:
-                    operation = _StreamAppendOperation(
-                        event_type=event_type,
-                        payload=payload,
-                        text=str(payload.get("text") or ""),
-                    )
-                    queue.operations.append(operation)
+            if sequence is None:
+                sequence = queue.next_auto_sequence
+                queue.next_auto_sequence += 1
+            elif sequence < 0:
+                raise ValueError("sequence must be non-negative")
+            elif sequence < queue.next_dispatch_sequence or sequence in queue.reserved_sequences:
+                raise ValueError(
+                    f"duplicate or already-dispatched stream append sequence: {sequence}"
+                )
             else:
-                operation = _StreamAppendOperation(event_type=event_type, payload=payload)
-                queue.operations.append(operation)
+                queue.next_auto_sequence = max(queue.next_auto_sequence, sequence + 1)
+
+            queue.reserved_sequences.add(sequence)
+
+            tiebreaker = queue._tiebreaker
+            queue._tiebreaker += 1
+            if event_type == "text.delta" and isinstance(payload.get("text"), str):
+                operation = _StreamAppendOperation(
+                    sequence=sequence,
+                    event_type=event_type,
+                    payload=payload,
+                    text=str(payload.get("text") or ""),
+                )
+            else:
+                operation = _StreamAppendOperation(
+                    sequence=sequence,
+                    event_type=event_type,
+                    payload=payload,
+                )
+            heapq.heappush(queue.operations, (sequence, tiebreaker, operation))
 
             if not queue.running:
                 queue.running = True
@@ -441,6 +540,7 @@ class AampClient(TinyEmitter):
                     args=(stream_id,),
                     daemon=True,
                 ).start()
+            queue.condition.notify_all()
 
             while not operation.done:
                 queue.condition.wait()

@@ -2,6 +2,10 @@
 
 Node.js SDK for connecting agents and services to AAMP.
 
+See the repository-wide [SDK capability matrix](../../../docs/SDK_CAPABILITY_MATRIX.md)
+and [shared conformance fixtures](../../../conformance/README.md) for parity
+across Node.js, Python, and Go.
+
 ## Install
 
 ```bash

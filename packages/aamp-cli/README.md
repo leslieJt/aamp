@@ -1,6 +1,6 @@
 # aamp-cli
 
-Command-line mailbox client for AAMP, built on top of [aamp-sdk](../sdk/README.md).
+Command-line mailbox client for AAMP, built on top of [aamp-sdk](../sdks/nodejs/README.md).
 
 ## What it does
 

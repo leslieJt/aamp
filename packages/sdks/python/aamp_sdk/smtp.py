@@ -15,12 +15,15 @@ from urllib.parse import urlencode, urljoin, urlparse
 from urllib.request import Request, urlopen
 
 from .protocol import (
+    AAMP_HEADER,
     build_ack_headers,
     build_cancel_headers,
     build_card_query_headers,
     build_card_response_headers,
     build_dispatch_headers,
     build_help_headers,
+    build_pair_request_headers,
+    build_pair_respond_headers,
     build_result_headers,
     build_stream_opened_headers,
 )
@@ -269,6 +272,7 @@ class SmtpSender:
         task_id: str | None = None,
         priority: str = "normal",
         expires_at: str | None = None,
+        session_key: str | None = None,
         dispatch_context: dict[str, str] | None = None,
         parent_task_id: str | None = None,
         attachments: list[Attachment] | None = None,
@@ -278,6 +282,7 @@ class SmtpSender:
             resolved_task_id,
             priority=priority,
             expires_at=expires_at,
+            session_key=session_key,
             dispatch_context=dispatch_context,
             parent_task_id=parent_task_id,
         )
@@ -461,5 +466,64 @@ class SmtpSender:
             subject=f"[AAMP Card] {_sanitize(summary)}",
             text=body_text,
             aamp_headers=build_card_response_headers(task_id, summary),
+            in_reply_to=in_reply_to,
+        )
+
+    def send_pair_request(
+        self,
+        *,
+        to: str,
+        pair_code: str,
+        task_id: str | None = None,
+        dispatch_context_rules: dict[str, list[str]] | None = None,
+    ) -> tuple[str, str]:
+        resolved_task_id = task_id or str(uuid.uuid4())
+        rules = dispatch_context_rules or {}
+        headers = build_pair_request_headers(
+            resolved_task_id,
+            pair_code,
+            dispatch_context_rules=rules,
+        )
+        validated_pair_code = headers[AAMP_HEADER["PAIR_CODE"]]
+        text = "\n".join(
+            [
+                "AAMP Pair Request",
+                "",
+                f"Pair code: {validated_pair_code}",
+                f"Dispatch context rules: {json.dumps(rules, separators=(',', ':'))}",
+            ]
+        )
+        message_id = self._dispatch(
+            to=to,
+            subject="[AAMP Pair] Connection request",
+            text=text,
+            aamp_headers=headers,
+        )
+        return resolved_task_id, message_id
+
+    def send_pair_respond(
+        self,
+        *,
+        to: str,
+        task_id: str,
+        success: bool,
+        reason: str | None = None,
+        in_reply_to: str | None = None,
+    ) -> None:
+        headers = build_pair_respond_headers(task_id, success=success, reason=reason)
+        status = "completed" if success else "rejected"
+        lines = [
+            "AAMP Pair Response",
+            "",
+            f"Task ID: {task_id}",
+            f"Status: {status}",
+        ]
+        if reason and reason.strip():
+            lines.extend(["", f"Reason: {reason.strip()}"])
+        self._dispatch(
+            to=to,
+            subject=f"[AAMP Pair] {status}",
+            text="\n".join(lines),
+            aamp_headers=headers,
             in_reply_to=in_reply_to,
         )

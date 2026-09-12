@@ -23,6 +23,9 @@ AAMP 是一个开放协议，用于让独立参与方依托普通邮箱基础设
 这个仓库包含协议定义以及围绕协议构建的通用工具链，不要求你使用定制邮件服务器，也不要求你维护一套分叉过的邮件栈。
 
 规范主文档见 [docs/AAMP_CORE_SPECIFICATION.md](./docs/AAMP_CORE_SPECIFICATION.md)。
+三套 SDK 的能力对齐情况和共享解析测试分别见
+[SDK 能力矩阵](./docs/SDK_CAPABILITY_MATRIX.md) 与
+[conformance fixtures](./conformance/README.md)。
 
 ## For Agents
 
@@ -576,6 +579,7 @@ packages/
   aamp-acp-bridge/
   aamp-cli-bridge/
   aamp-feishu-bridge/
+  aamp-wechat-bridge/
 ```
 
 仓库中的示例可能会使用 `meshmail.ai` 作为兼容的 AAMP Host。

@@ -2,6 +2,7 @@ package aamp
 
 import (
 	"bytes"
+	"container/heap"
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
@@ -25,17 +26,49 @@ type Client struct {
 }
 
 type streamAppendQueue struct {
-	cond       *sync.Cond
-	running    bool
-	operations []*streamAppendOperation
+	cond                 *sync.Cond
+	running              bool
+	operations           streamAppendHeap
+	reservedSequences    map[int]struct{}
+	nextAutoSequence     int
+	nextDispatchSequence int
+	tiebreaker           int
+	gapWaitStartedAt     time.Time
 }
 
 type streamAppendOperation struct {
-	kind    string
-	opts    AppendStreamEventOptions
-	text    string
-	payload map[string]any
-	waiters []chan streamAppendResult
+	sequence   int
+	tiebreaker int
+	kind       string
+	opts       AppendStreamEventOptions
+	text       string
+	payload    map[string]any
+	waiters    []chan streamAppendResult
+}
+
+type streamAppendHeap []*streamAppendOperation
+
+func (h streamAppendHeap) Len() int { return len(h) }
+
+func (h streamAppendHeap) Less(i, j int) bool {
+	if h[i].sequence != h[j].sequence {
+		return h[i].sequence < h[j].sequence
+	}
+	return h[i].tiebreaker < h[j].tiebreaker
+}
+
+func (h streamAppendHeap) Swap(i, j int) { h[i], h[j] = h[j], h[i] }
+
+func (h *streamAppendHeap) Push(x any) {
+	*h = append(*h, x.(*streamAppendOperation))
+}
+
+func (h *streamAppendHeap) Pop() any {
+	old := *h
+	n := len(old)
+	item := old[n-1]
+	*h = old[:n-1]
+	return item
 }
 
 type streamAppendResult struct {
@@ -103,6 +136,8 @@ func NewClient(config Config) (*Client, error) {
 		"task.help_needed",
 		"task.ack",
 		"task.stream.opened",
+		"pair.request",
+		"pair.respond",
 		"card.query",
 		"card.response",
 		"reply",
@@ -146,14 +181,15 @@ func FromMailboxIdentity(config MailboxIdentityConfig) (*Client, error) {
 	}
 	token := base64.StdEncoding.EncodeToString([]byte(config.Email + ":" + config.SMTPPassword))
 	return NewClient(Config{
-		Email:              config.Email,
-		MailboxToken:       token,
-		BaseURL:            firstNonEmpty(baseURL, "https://"+strings.SplitN(config.Email, "@", 2)[1]),
-		SMTPHost:           smtpHost,
-		SMTPPort:           config.SMTPPort,
-		SMTPPassword:       config.SMTPPassword,
-		ReconnectInterval:  config.ReconnectInterval,
-		RejectUnauthorized: config.RejectUnauthorized,
+		Email:                       config.Email,
+		MailboxToken:                token,
+		BaseURL:                     firstNonEmpty(baseURL, "https://"+strings.SplitN(config.Email, "@", 2)[1]),
+		SMTPHost:                    smtpHost,
+		SMTPPort:                    config.SMTPPort,
+		SMTPPassword:                config.SMTPPassword,
+		ReconnectInterval:           config.ReconnectInterval,
+		RejectUnauthorized:          config.RejectUnauthorized,
+		StreamAppendSequenceTimeout: config.StreamAppendSequenceTimeout,
 	})
 }
 
@@ -266,6 +302,14 @@ func (c *Client) SendCardResponse(opts SendCardResponseOptions) error {
 	return c.SmtpSender.SendCardResponse(opts)
 }
 
+func (c *Client) SendPairRequest(opts SendPairRequestOptions) (string, string, error) {
+	return c.SmtpSender.SendPairRequest(opts)
+}
+
+func (c *Client) SendPairRespond(opts SendPairRespondOptions) error {
+	return c.SmtpSender.SendPairRespond(opts)
+}
+
 func (c *Client) DownloadBlob(blobID, filename string) ([]byte, error) {
 	return c.JmapClient.DownloadBlob(blobID, filename)
 }
@@ -352,10 +396,34 @@ func (c *Client) getStreamAppendQueue(streamID string) *streamAppendQueue {
 	if ok {
 		return queue
 	}
-	queue = &streamAppendQueue{}
+	queue = &streamAppendQueue{
+		reservedSequences: make(map[int]struct{}),
+	}
 	queue.cond = sync.NewCond(&sync.Mutex{})
 	c.streamAppendQueues[streamID] = queue
 	return queue
+}
+
+func (c *Client) streamAppendSequenceTimeout() time.Duration {
+	if c.Config.StreamAppendSequenceTimeout > 0 {
+		return c.Config.StreamAppendSequenceTimeout
+	}
+	return 30 * time.Second
+}
+
+func (c *Client) failPendingStreamAppendOperations(queue *streamAppendQueue, err error) {
+	pending := append([]*streamAppendOperation(nil), queue.operations...)
+	queue.operations = nil
+	for _, operation := range pending {
+		delete(queue.reservedSequences, operation.sequence)
+		for _, waiter := range operation.waiters {
+			waiter <- streamAppendResult{err: err}
+			close(waiter)
+		}
+	}
+	queue.gapWaitStartedAt = time.Time{}
+	queue.running = false
+	queue.cond.Broadcast()
 }
 
 func clonePayload(payload map[string]any) map[string]any {
@@ -382,24 +450,72 @@ func (c *Client) dispatchStreamAppend(opts AppendStreamEventOptions) (*StreamEve
 	return &response, nil
 }
 
+func (c *Client) coalescePendingTextDeltaOperations(queue *streamAppendQueue, operation *streamAppendOperation) []*streamAppendOperation {
+	merged := []*streamAppendOperation{operation}
+	if operation.kind != "text-delta-batch" {
+		return merged
+	}
+
+	for len(queue.operations) > 0 {
+		nextOperation := queue.operations[0]
+		if nextOperation.kind != "text-delta-batch" {
+			break
+		}
+		if nextOperation.sequence != operation.sequence+len(merged) {
+			break
+		}
+		heap.Pop(&queue.operations)
+		operation.text += nextOperation.text
+		merged = append(merged, nextOperation)
+	}
+	return merged
+}
+
 func (c *Client) drainStreamAppendQueue(streamID string) {
 	queue := c.getStreamAppendQueue(streamID)
+	queue.cond.L.Lock()
 	for {
-		queue.cond.L.Lock()
 		if len(queue.operations) == 0 {
 			queue.running = false
+			queue.gapWaitStartedAt = time.Time{}
 			queue.cond.Broadcast()
 			queue.cond.L.Unlock()
-
-			c.streamAppendMu.Lock()
-			if !queue.running && len(queue.operations) == 0 {
-				delete(c.streamAppendQueues, streamID)
-			}
-			c.streamAppendMu.Unlock()
 			return
 		}
-		operation := queue.operations[0]
-		queue.operations = queue.operations[1:]
+		if queue.operations[0].sequence != queue.nextDispatchSequence {
+			now := time.Now()
+			if queue.gapWaitStartedAt.IsZero() {
+				queue.gapWaitStartedAt = now
+			}
+			remaining := c.streamAppendSequenceTimeout() - now.Sub(queue.gapWaitStartedAt)
+			if remaining <= 0 {
+				missing := queue.nextDispatchSequence
+				pendingMin := queue.operations[0].sequence
+				c.failPendingStreamAppendOperations(
+					queue,
+					fmt.Errorf(
+						"timed out after %s waiting for stream append sequence %d on stream %s; lowest pending sequence is %d",
+						c.streamAppendSequenceTimeout(),
+						missing,
+						streamID,
+						pendingMin,
+					),
+				)
+				queue.cond.L.Unlock()
+				return
+			}
+			timer := time.AfterFunc(remaining, func() {
+				queue.cond.L.Lock()
+				queue.cond.Broadcast()
+				queue.cond.L.Unlock()
+			})
+			queue.cond.Wait()
+			timer.Stop()
+			continue
+		}
+		queue.gapWaitStartedAt = time.Time{}
+		operation := heap.Pop(&queue.operations).(*streamAppendOperation)
+		mergedOperations := c.coalescePendingTextDeltaOperations(queue, operation)
 		queue.cond.L.Unlock()
 
 		payload := clonePayload(operation.payload)
@@ -412,10 +528,16 @@ func (c *Client) drainStreamAppendQueue(streamID string) {
 			Type:     operation.opts.Type,
 			Payload:  payload,
 		})
-		for _, waiter := range operation.waiters {
-			waiter <- streamAppendResult{event: event, err: err}
-			close(waiter)
+		queue.cond.L.Lock()
+		queue.nextDispatchSequence += len(mergedOperations)
+		for _, mergedOperation := range mergedOperations {
+			delete(queue.reservedSequences, mergedOperation.sequence)
+			for _, waiter := range mergedOperation.waiters {
+				waiter <- streamAppendResult{event: event, err: err}
+				close(waiter)
+			}
 		}
+		queue.cond.Broadcast()
 	}
 }
 
@@ -433,47 +555,55 @@ func (c *Client) AppendStreamEvent(opts AppendStreamEventOptions) (*StreamEvent,
 	waiter := make(chan streamAppendResult, 1)
 
 	queue.cond.L.Lock()
-	if opts.Type == "text.delta" {
-		if text, ok := opts.Payload["text"].(string); ok {
-			if len(queue.operations) > 0 {
-				lastOperation := queue.operations[len(queue.operations)-1]
-				if lastOperation.kind == "text-delta-batch" {
-					lastOperation.text += text
-					lastOperation.waiters = append(lastOperation.waiters, waiter)
-					queue.cond.L.Unlock()
-					result := <-waiter
-					return result.event, result.err
-				}
-			}
-
-			queue.operations = append(queue.operations, &streamAppendOperation{
-				kind:    "text-delta-batch",
-				opts:    opts,
-				text:    text,
-				payload: clonePayload(opts.Payload),
-				waiters: []chan streamAppendResult{waiter},
-			})
-		} else {
-			queue.operations = append(queue.operations, &streamAppendOperation{
-				kind:    "single-event",
-				opts:    opts,
-				payload: clonePayload(opts.Payload),
-				waiters: []chan streamAppendResult{waiter},
-			})
+	sequence := queue.nextAutoSequence
+	if opts.Sequence != nil {
+		if *opts.Sequence < 0 {
+			queue.cond.L.Unlock()
+			return nil, fmt.Errorf("sequence must be non-negative")
+		}
+		sequence = *opts.Sequence
+		if sequence < queue.nextDispatchSequence {
+			queue.cond.L.Unlock()
+			return nil, fmt.Errorf("duplicate or already-dispatched stream append sequence: %d", sequence)
+		}
+		if _, exists := queue.reservedSequences[sequence]; exists {
+			queue.cond.L.Unlock()
+			return nil, fmt.Errorf("duplicate or already-dispatched stream append sequence: %d", sequence)
+		}
+		if sequence+1 > queue.nextAutoSequence {
+			queue.nextAutoSequence = sequence + 1
 		}
 	} else {
-		queue.operations = append(queue.operations, &streamAppendOperation{
-			kind:    "single-event",
-			opts:    opts,
-			payload: clonePayload(opts.Payload),
-			waiters: []chan streamAppendResult{waiter},
-		})
+		queue.nextAutoSequence++
 	}
+	queue.reservedSequences[sequence] = struct{}{}
+	tiebreaker := queue.tiebreaker
+	queue.tiebreaker++
+
+	operation := &streamAppendOperation{
+		sequence:   sequence,
+		tiebreaker: tiebreaker,
+		opts:       opts,
+		payload:    clonePayload(opts.Payload),
+		waiters:    []chan streamAppendResult{waiter},
+	}
+	if opts.Type == "text.delta" {
+		if text, ok := opts.Payload["text"].(string); ok {
+			operation.kind = "text-delta-batch"
+			operation.text = text
+		} else {
+			operation.kind = "single-event"
+		}
+	} else {
+		operation.kind = "single-event"
+	}
+	heap.Push(&queue.operations, operation)
 
 	if !queue.running {
 		queue.running = true
 		go c.drainStreamAppendQueue(opts.StreamID)
 	}
+	queue.cond.Broadcast()
 	queue.cond.L.Unlock()
 
 	result := <-waiter

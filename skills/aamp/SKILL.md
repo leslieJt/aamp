@@ -41,11 +41,11 @@ Use `aamp-cli` as the default control plane for AAMP. Do not handcraft
 Prefer the first option that works:
 
 1. `aamp-cli ...`
-2. `node /absolute/path/to/packages/cli/dist/index.js ...`
-3. `npm --prefix /absolute/path/to/packages/cli run dev -- ...`
+2. `node /absolute/path/to/packages/aamp-cli/dist/index.js ...`
+3. `npm --prefix /absolute/path/to/packages/aamp-cli run dev -- ...`
 
 When working inside this monorepo, option 3 is the safest fallback because
-`packages/cli/dist` may not exist yet.
+`packages/aamp-cli/dist` may not exist yet.
 
 ## Core Rules
 

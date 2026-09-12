@@ -3,6 +3,7 @@ package aamp
 import (
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"mime"
 	"net/url"
 	"regexp"
@@ -24,6 +25,9 @@ const (
 	HeaderStreamID      = "X-AAMP-Stream-Id"
 	HeaderParentTaskID  = "X-AAMP-ParentTaskId"
 	HeaderCardSummary   = "X-AAMP-Card-Summary"
+	HeaderSessionKey    = "X-AAMP-Session-Key"
+	HeaderPairCode      = "X-AAMP-Pair-Code"
+	HeaderDispatchRules = "X-AAMP-Dispatch-Context-Rules"
 )
 
 var dispatchContextKeyRE = regexp.MustCompile(`^[a-z0-9_-]+$`)
@@ -84,7 +88,7 @@ func SerializeDispatchContextHeader(context map[string]string) string {
 	return strings.Join(parts, "; ")
 }
 
-func BuildDispatchHeaders(taskID, priority, expiresAt string, dispatchContext map[string]string, parentTaskID string) map[string]string {
+func BuildDispatchHeaders(taskID, priority, expiresAt, sessionKey string, dispatchContext map[string]string, parentTaskID string) map[string]string {
 	headers := map[string]string{
 		HeaderVersion: AAMPProtocolVersion,
 		HeaderIntent:  "task.dispatch",
@@ -98,6 +102,9 @@ func BuildDispatchHeaders(taskID, priority, expiresAt string, dispatchContext ma
 	}
 	if expiresAt != "" {
 		headers[HeaderExpiresAt] = expiresAt
+	}
+	if trimmed := strings.TrimSpace(sessionKey); trimmed != "" {
+		headers[HeaderSessionKey] = trimmed
 	}
 	if serialized := SerializeDispatchContextHeader(dispatchContext); serialized != "" {
 		headers[HeaderDispatchCtx] = serialized
@@ -175,6 +182,107 @@ func BuildCardResponseHeaders(taskID, summary string) map[string]string {
 	}
 }
 
+func validatePairCode(pairCode string) (string, error) {
+	trimmed := strings.TrimSpace(pairCode)
+	if trimmed == "" {
+		return "", fmt.Errorf("pairCode cannot be empty")
+	}
+	if strings.ContainsAny(trimmed, "\r\n") {
+		return "", fmt.Errorf("pairCode contains invalid characters")
+	}
+	if !isValidBase64URLToken(trimmed) {
+		return "", fmt.Errorf("pairCode must be a base64url token")
+	}
+	return trimmed, nil
+}
+
+func isValidBase64URLToken(value string) bool {
+	if _, err := base64.RawURLEncoding.DecodeString(value); err == nil {
+		return true
+	}
+	_, err := base64.URLEncoding.DecodeString(value)
+	return err == nil
+}
+
+func BuildPairRequestHeaders(taskID, pairCode string, dispatchContextRules map[string][]string) (map[string]string, error) {
+	validated, err := validatePairCode(pairCode)
+	if err != nil {
+		return nil, err
+	}
+	rules := dispatchContextRules
+	if rules == nil {
+		rules = map[string][]string{}
+	}
+	return map[string]string{
+		HeaderVersion:       AAMPProtocolVersion,
+		HeaderIntent:        "pair.request",
+		HeaderTaskID:        taskID,
+		HeaderPairCode:      validated,
+		HeaderDispatchRules: encodeBase64URLJSON(rules),
+	}, nil
+}
+
+func BuildPairRespondHeaders(taskID string, success bool, reason string) map[string]string {
+	status := "rejected"
+	if success {
+		status = "completed"
+	}
+	headers := map[string]string{
+		HeaderVersion: AAMPProtocolVersion,
+		HeaderIntent:  "pair.respond",
+		HeaderTaskID:  taskID,
+		HeaderStatus:  status,
+	}
+	if !success {
+		if cleaned := sanitizePairReason(reason); cleaned != "" {
+			headers[HeaderErrorMsg] = cleaned
+		}
+	}
+	return headers
+}
+
+func sanitizePairReason(reason string) string {
+	cleaned := strings.TrimSpace(strings.ReplaceAll(strings.ReplaceAll(reason, "\r", " "), "\n", " "))
+	return cleaned
+}
+
+func encodeBase64URLJSON(value any) string {
+	payload, err := json.Marshal(value)
+	if err != nil {
+		return ""
+	}
+	return base64.RawURLEncoding.EncodeToString(payload)
+}
+
+func decodeBase64URLJSONMapStringSlice(value string) map[string][]string {
+	if strings.TrimSpace(value) == "" {
+		return map[string][]string{}
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(value)
+	if err != nil {
+		// Accept standard base64 with padding, matching Node's decode path.
+		normalized := strings.ReplaceAll(strings.ReplaceAll(value, "-", "+"), "_", "/")
+		switch len(normalized) % 4 {
+		case 2:
+			normalized += "=="
+		case 3:
+			normalized += "="
+		}
+		payload, err = base64.StdEncoding.DecodeString(normalized)
+		if err != nil {
+			return map[string][]string{}
+		}
+	}
+	decoded := map[string][]string{}
+	if err := json.Unmarshal(payload, &decoded); err != nil {
+		return map[string][]string{}
+	}
+	if decoded == nil {
+		return map[string][]string{}
+	}
+	return decoded
+}
+
 func ParseAampHeaders(meta EmailMetadata) (*ParsedMessage, error) {
 	headers := NormalizeHeaders(meta.Headers)
 	intent := headers[strings.ToLower(HeaderIntent)]
@@ -208,6 +316,7 @@ func ParseAampHeaders(meta EmailMetadata) (*ParsedMessage, error) {
 		base.Title = strings.TrimSpace(strings.TrimPrefix(subject, "[AAMP Task]"))
 		base.Priority = firstNonEmpty(headers[strings.ToLower(HeaderPriority)], "normal")
 		base.ExpiresAt = headers[strings.ToLower(HeaderExpiresAt)]
+		base.SessionKey = headers[strings.ToLower(HeaderSessionKey)]
 		base.DispatchContext = ParseDispatchContextHeader(headers[strings.ToLower(HeaderDispatchCtx)])
 		base.ParentTaskID = headers[strings.ToLower(HeaderParentTaskID)]
 		base.BodyText = normalizeBodyText(meta.BodyText)
@@ -227,6 +336,25 @@ func ParseAampHeaders(meta EmailMetadata) (*ParsedMessage, error) {
 	case "task.ack":
 	case "task.stream.opened":
 		base.StreamID = headers[strings.ToLower(HeaderStreamID)]
+	case "pair.request":
+		pairCode := headers[strings.ToLower(HeaderPairCode)]
+		if pairCode == "" {
+			return nil, nil
+		}
+		base.PairCode = pairCode
+		base.DispatchContextRules = decodeBase64URLJSONMapStringSlice(headers[strings.ToLower(HeaderDispatchRules)])
+		base.BodyText = normalizeBodyText(meta.BodyText)
+	case "pair.respond":
+		rawStatus := headers[strings.ToLower(HeaderStatus)]
+		if rawStatus == "completed" {
+			base.Status = "completed"
+			base.Success = true
+		} else {
+			base.Status = "rejected"
+			base.Success = false
+		}
+		base.ErrorMsg = headers[strings.ToLower(HeaderErrorMsg)]
+		base.BodyText = normalizeBodyText(meta.BodyText)
 	case "card.query":
 		base.BodyText = normalizeBodyText(meta.BodyText)
 	case "card.response":

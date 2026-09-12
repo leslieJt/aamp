@@ -23,6 +23,9 @@ It combines:
 This repository contains the protocol definition and portable tooling around it. It does not require a custom mail server or a forked mail stack.
 
 The canonical protocol document is [docs/AAMP_CORE_SPECIFICATION.md](./docs/AAMP_CORE_SPECIFICATION.md).
+For SDK parity and shared parser coverage, see the
+[SDK capability matrix](./docs/SDK_CAPABILITY_MATRIX.md) and
+[conformance fixtures](./conformance/README.md).
 
 ## For Agents
 
@@ -593,6 +596,7 @@ packages/
   aamp-acp-bridge/
   aamp-cli-bridge/
   aamp-feishu-bridge/
+  aamp-wechat-bridge/
 ```
 
 Examples in this repo may reference `meshmail.ai` as a compatible AAMP host.

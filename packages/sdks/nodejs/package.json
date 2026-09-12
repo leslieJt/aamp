@@ -19,8 +19,7 @@
   "scripts": {
     "dev": "tsx watch src/index.ts",
     "build": "tsc",
-    "test": "vitest run",
-    "lint": "eslint src --ext .ts"
+    "test": "vitest run"
   },
   "dependencies": {
     "nodemailer": "^6.9.10",

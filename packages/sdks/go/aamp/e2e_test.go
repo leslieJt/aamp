@@ -667,42 +667,25 @@ func TestClientAppendStreamEventSerializesAndCoalescesTextDeltaPerStream(t *test
 		tokens[index] = string(rune('A' + index))
 	}
 
+	start := make(chan struct{})
 	var wg sync.WaitGroup
-	firstToken := tokens[0]
-	wg.Add(1)
-	go func(text string) {
-		defer wg.Done()
-		if _, err := client.AppendStreamEvent(AppendStreamEventOptions{
-			StreamID: stream.StreamID,
-			Type:     "text.delta",
-			Payload:  map[string]any{"text": text},
-		}); err != nil {
-			t.Errorf("append stream failed: %v", err)
-		}
-	}(firstToken)
-	time.Sleep(10 * time.Millisecond)
-
-	releases := make([]chan struct{}, 0, len(tokens)-1)
-	for _, token := range tokens[1:] {
-		release := make(chan struct{})
-		releases = append(releases, release)
+	for index, token := range tokens {
 		wg.Add(1)
-		go func(text string, gate <-chan struct{}) {
+		go func(sequence int, text string) {
 			defer wg.Done()
-			<-gate
+			<-start
+			seq := sequence
 			if _, err := client.AppendStreamEvent(AppendStreamEventOptions{
 				StreamID: stream.StreamID,
 				Type:     "text.delta",
 				Payload:  map[string]any{"text": text},
+				Sequence: &seq,
 			}); err != nil {
 				t.Errorf("append stream failed: %v", err)
 			}
-		}(token, release)
+		}(index, token)
 	}
-	for _, release := range releases {
-		close(release)
-		time.Sleep(2 * time.Millisecond)
-	}
+	close(start)
 	wg.Wait()
 
 	state.mu.Lock()
@@ -723,5 +706,207 @@ func TestClientAppendStreamEventSerializesAndCoalescesTextDeltaPerStream(t *test
 
 	if builder.String() != strings.Join(tokens, "") {
 		t.Fatalf("expected received text %q, got %q", strings.Join(tokens, ""), builder.String())
+	}
+}
+
+func TestClientAppendStreamEventDispatchesByExplicitSequenceOutOfEnqueueOrder(t *testing.T) {
+	server, state := newMockServer(t)
+	defer server.Close()
+
+	client, err := FromMailboxIdentity(MailboxIdentityConfig{
+		Email:              "agent@mesh.local",
+		SMTPPassword:       "agent-pass",
+		BaseURL:            server.URL,
+		ReconnectInterval:  100 * time.Millisecond,
+		RejectUnauthorized: false,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	stream, err := client.CreateStream(CreateStreamOptions{
+		TaskID:    "task-stream-explicit-sequence",
+		PeerEmail: "dispatcher@mesh.local",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tokens := make([]string, 26)
+	for index := range tokens {
+		tokens[index] = string(rune('A' + index))
+	}
+
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for index := len(tokens) - 1; index >= 0; index-- {
+		wg.Add(1)
+		go func(sequence int, text string) {
+			defer wg.Done()
+			<-start
+			seq := sequence
+			if _, err := client.AppendStreamEvent(AppendStreamEventOptions{
+				StreamID: stream.StreamID,
+				Type:     "text.delta",
+				Payload:  map[string]any{"text": text},
+				Sequence: &seq,
+			}); err != nil {
+				t.Errorf("append stream failed: %v", err)
+			}
+		}(index, tokens[index])
+	}
+	close(start)
+	wg.Wait()
+
+	state.mu.Lock()
+	events := slices.Clone(state.streams[stream.StreamID].Events)
+	state.mu.Unlock()
+
+	if len(events) == 0 {
+		t.Fatal("expected at least one stream event")
+	}
+	if len(events) >= len(tokens) {
+		t.Fatalf("expected coalesced text.delta events, got %d events for %d tokens", len(events), len(tokens))
+	}
+
+	var builder strings.Builder
+	for _, event := range events {
+		builder.WriteString(fmt.Sprint(event["payload"].(map[string]any)["text"]))
+	}
+
+	if builder.String() != strings.Join(tokens, "") {
+		t.Fatalf("expected received text %q, got %q", strings.Join(tokens, ""), builder.String())
+	}
+}
+
+func TestClientAppendStreamEventRejectsDuplicateSequence(t *testing.T) {
+	server, _ := newMockServer(t)
+	defer server.Close()
+
+	client, err := FromMailboxIdentity(MailboxIdentityConfig{
+		Email:              "agent@mesh.local",
+		SMTPPassword:       "agent-pass",
+		BaseURL:            server.URL,
+		ReconnectInterval:  100 * time.Millisecond,
+		RejectUnauthorized: false,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	stream, err := client.CreateStream(CreateStreamOptions{
+		TaskID:    "task-stream-duplicate-sequence",
+		PeerEmail: "dispatcher@mesh.local",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	seq0 := 0
+	if _, err := client.AppendStreamEvent(AppendStreamEventOptions{
+		StreamID: stream.StreamID,
+		Type:     "text.delta",
+		Payload:  map[string]any{"text": "A"},
+		Sequence: &seq0,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := client.AppendStreamEvent(AppendStreamEventOptions{
+		StreamID: stream.StreamID,
+		Type:     "text.delta",
+		Payload:  map[string]any{"text": "A2"},
+		Sequence: &seq0,
+	}); err == nil || !strings.Contains(err.Error(), "duplicate") {
+		t.Fatalf("expected duplicate sequence error, got %v", err)
+	}
+
+	started := make(chan struct{})
+	errCh := make(chan error, 1)
+	go func() {
+		close(started)
+		seq2 := 2
+		_, err := client.AppendStreamEvent(AppendStreamEventOptions{
+			StreamID: stream.StreamID,
+			Type:     "text.delta",
+			Payload:  map[string]any{"text": "C"},
+			Sequence: &seq2,
+		})
+		errCh <- err
+	}()
+	<-started
+	time.Sleep(50 * time.Millisecond)
+
+	seq2 := 2
+	if _, err := client.AppendStreamEvent(AppendStreamEventOptions{
+		StreamID: stream.StreamID,
+		Type:     "text.delta",
+		Payload:  map[string]any{"text": "C2"},
+		Sequence: &seq2,
+	}); err == nil || !strings.Contains(err.Error(), "duplicate") {
+		t.Fatalf("expected duplicate pending sequence error, got %v", err)
+	}
+
+	seq1 := 1
+	if _, err := client.AppendStreamEvent(AppendStreamEventOptions{
+		StreamID: stream.StreamID,
+		Type:     "text.delta",
+		Payload:  map[string]any{"text": "B"},
+		Sequence: &seq1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-errCh; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestClientAppendStreamEventTimesOutOnMissingSequence(t *testing.T) {
+	server, _ := newMockServer(t)
+	defer server.Close()
+
+	client, err := FromMailboxIdentity(MailboxIdentityConfig{
+		Email:                       "agent@mesh.local",
+		SMTPPassword:                "agent-pass",
+		BaseURL:                     server.URL,
+		ReconnectInterval:           100 * time.Millisecond,
+		RejectUnauthorized:          false,
+		StreamAppendSequenceTimeout: 100 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	stream, err := client.CreateStream(CreateStreamOptions{
+		TaskID:    "task-stream-missing-sequence",
+		PeerEmail: "dispatcher@mesh.local",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	seq1 := 1
+	_, err = client.AppendStreamEvent(AppendStreamEventOptions{
+		StreamID: stream.StreamID,
+		Type:     "text.delta",
+		Payload:  map[string]any{"text": "B"},
+		Sequence: &seq1,
+	})
+	if err == nil || !strings.Contains(err.Error(), "waiting for stream append sequence 0") {
+		t.Fatalf("expected missing sequence timeout, got %v", err)
+	}
+
+	seq0 := 0
+	event, err := client.AppendStreamEvent(AppendStreamEventOptions{
+		StreamID: stream.StreamID,
+		Type:     "text.delta",
+		Payload:  map[string]any{"text": "A"},
+		Sequence: &seq0,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if event == nil || event.ID == "" {
+		t.Fatalf("expected recovered append event, got %#v", event)
 	}
 }

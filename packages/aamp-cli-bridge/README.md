@@ -15,7 +15,7 @@ npm install aamp-cli-bridge
 From this repo:
 
 ```bash
-cd packages/cli-bridge
+cd packages/aamp-cli-bridge
 npm install
 npm run build
 ```

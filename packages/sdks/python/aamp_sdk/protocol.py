@@ -17,6 +17,7 @@ AAMP_HEADER = {
     "DISPATCH_CONTEXT": "X-AAMP-Dispatch-Context",
     "PRIORITY": "X-AAMP-Priority",
     "EXPIRES_AT": "X-AAMP-Expires-At",
+    "SESSION_KEY": "X-AAMP-Session-Key",
     "STATUS": "X-AAMP-Status",
     "ERROR_MSG": "X-AAMP-ErrorMsg",
     "STRUCTURED_RESULT": "X-AAMP-StructuredResult",
@@ -24,9 +25,12 @@ AAMP_HEADER = {
     "STREAM_ID": "X-AAMP-Stream-Id",
     "PARENT_TASK_ID": "X-AAMP-ParentTaskId",
     "CARD_SUMMARY": "X-AAMP-Card-Summary",
+    "PAIR_CODE": "X-AAMP-Pair-Code",
+    "DISPATCH_RULES": "X-AAMP-Dispatch-Context-Rules",
 }
 
 _DISPATCH_CONTEXT_KEY_RE = re.compile(r"^[a-z0-9_-]+$")
+_PAIR_CODE_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 
 
 def normalize_headers(headers: Mapping[str, Any]) -> dict[str, str]:
@@ -78,18 +82,80 @@ def serialize_dispatch_context_header(context: Mapping[str, Any] | None) -> str 
     return "; ".join(parts) or None
 
 
+def _b64url_encode(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).decode("ascii").rstrip("=")
+
+
+def _b64url_decode(value: str) -> bytes:
+    raw = value.strip()
+    padding = "=" * (-len(raw) % 4)
+    try:
+        return base64.urlsafe_b64decode(raw + padding)
+    except Exception:
+        normalized = raw.replace("-", "+").replace("_", "/")
+        padding = "=" * (-len(normalized) % 4)
+        return base64.b64decode(normalized + padding)
+
+
+def _encode_base64url_json(value: Any) -> str:
+    payload = json.dumps(value, separators=(",", ":")).encode("utf-8")
+    return _b64url_encode(payload)
+
+
+def _decode_base64url_json_map_string_slice(value: str | None) -> dict[str, list[str]]:
+    if not value or not str(value).strip():
+        return {}
+    try:
+        decoded = json.loads(_b64url_decode(str(value).strip()).decode("utf-8"))
+    except Exception:
+        return {}
+    if not isinstance(decoded, dict):
+        return {}
+    result: dict[str, list[str]] = {}
+    for key, values in decoded.items():
+        if isinstance(values, list):
+            result[str(key)] = [str(item) for item in values]
+    return result
+
+
+def _is_valid_base64url_token(value: str) -> bool:
+    if not _PAIR_CODE_RE.match(value):
+        return False
+    try:
+        _b64url_decode(value)
+        return True
+    except Exception:
+        return False
+
+
+def _validate_pair_code(pair_code: str) -> str:
+    trimmed = pair_code.strip()
+    if not trimmed:
+        raise ValueError("pairCode cannot be empty")
+    if "\r" in trimmed or "\n" in trimmed:
+        raise ValueError("pairCode contains invalid characters")
+    if not _is_valid_base64url_token(trimmed):
+        raise ValueError("pairCode must be a base64url token")
+    return trimmed
+
+
+def _sanitize_pair_reason(reason: str | None) -> str:
+    if not reason:
+        return ""
+    return reason.replace("\r", " ").replace("\n", " ").strip()
+
+
 def _encode_structured_result(value: Any | None) -> str | None:
     if value is None:
         return None
     payload = json.dumps(value, separators=(",", ":")).encode("utf-8")
-    return base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
+    return _b64url_encode(payload)
 
 
 def _decode_structured_result(value: str | None) -> Any | None:
     if not value:
         return None
-    padding = "=" * (-len(value) % 4)
-    decoded = base64.urlsafe_b64decode((value + padding).encode("ascii"))
+    decoded = _b64url_decode(value)
     return json.loads(decoded.decode("utf-8"))
 
 
@@ -175,6 +241,7 @@ def build_dispatch_headers(
     task_id: str,
     priority: str | None = None,
     expires_at: str | None = None,
+    session_key: str | None = None,
     dispatch_context: Mapping[str, Any] | None = None,
     parent_task_id: str | None = None,
 ) -> dict[str, str]:
@@ -186,6 +253,9 @@ def build_dispatch_headers(
     }
     if expires_at:
         headers[AAMP_HEADER["EXPIRES_AT"]] = expires_at
+    trimmed_session_key = session_key.strip() if session_key else ""
+    if trimmed_session_key:
+        headers[AAMP_HEADER["SESSION_KEY"]] = trimmed_session_key
     serialized_context = serialize_dispatch_context_header(dispatch_context)
     if serialized_context:
         headers[AAMP_HEADER["DISPATCH_CONTEXT"]] = serialized_context
@@ -272,6 +342,42 @@ def build_card_response_headers(task_id: str, summary: str) -> dict[str, str]:
     }
 
 
+def build_pair_request_headers(
+    task_id: str,
+    pair_code: str,
+    dispatch_context_rules: Mapping[str, list[str]] | None = None,
+) -> dict[str, str]:
+    validated_pair_code = _validate_pair_code(pair_code)
+    rules = dict(dispatch_context_rules or {})
+    return {
+        AAMP_HEADER["VERSION"]: AAMP_PROTOCOL_VERSION,
+        AAMP_HEADER["INTENT"]: "pair.request",
+        AAMP_HEADER["TASK_ID"]: task_id,
+        AAMP_HEADER["PAIR_CODE"]: validated_pair_code,
+        AAMP_HEADER["DISPATCH_RULES"]: _encode_base64url_json(rules),
+    }
+
+
+def build_pair_respond_headers(
+    task_id: str,
+    *,
+    success: bool,
+    reason: str | None = None,
+) -> dict[str, str]:
+    status = "completed" if success else "rejected"
+    headers = {
+        AAMP_HEADER["VERSION"]: AAMP_PROTOCOL_VERSION,
+        AAMP_HEADER["INTENT"]: "pair.respond",
+        AAMP_HEADER["TASK_ID"]: task_id,
+        AAMP_HEADER["STATUS"]: status,
+    }
+    if not success:
+        cleaned_reason = _sanitize_pair_reason(reason)
+        if cleaned_reason:
+            headers[AAMP_HEADER["ERROR_MSG"]] = cleaned_reason
+    return headers
+
+
 def parse_aamp_headers(meta: Mapping[str, Any]) -> dict[str, Any] | None:
     headers = normalize_headers(meta.get("headers", {}))
     intent = headers.get(AAMP_HEADER["INTENT"].lower())
@@ -302,6 +408,7 @@ def parse_aamp_headers(meta: Mapping[str, Any]) -> dict[str, Any] | None:
             "title": subject.replace("[AAMP Task]", "").strip() or subject,
             "priority": headers.get(AAMP_HEADER["PRIORITY"].lower(), "normal"),
             "expiresAt": headers.get(AAMP_HEADER["EXPIRES_AT"].lower()),
+            "sessionKey": headers.get(AAMP_HEADER["SESSION_KEY"].lower()),
             "dispatchContext": parse_dispatch_context_header(
                 headers.get(AAMP_HEADER["DISPATCH_CONTEXT"].lower())
             ),
@@ -334,6 +441,32 @@ def parse_aamp_headers(meta: Mapping[str, Any]) -> dict[str, Any] | None:
 
     if intent == "task.stream.opened":
         return {**base, "streamId": headers.get(AAMP_HEADER["STREAM_ID"].lower(), "")}
+
+    if intent == "pair.request":
+        pair_code = headers.get(AAMP_HEADER["PAIR_CODE"].lower(), "")
+        if not pair_code:
+            return None
+        return {
+            **base,
+            "pairCode": pair_code,
+            "dispatchContextRules": _decode_base64url_json_map_string_slice(
+                headers.get(AAMP_HEADER["DISPATCH_RULES"].lower())
+            ),
+            "bodyText": _normalize_body_text(body_text),
+        }
+
+    if intent == "pair.respond":
+        raw_status = headers.get(AAMP_HEADER["STATUS"].lower(), "")
+        success = raw_status == "completed"
+        status = "completed" if success else "rejected"
+        return {
+            **base,
+            "status": status,
+            "success": success,
+            "reason": headers.get(AAMP_HEADER["ERROR_MSG"].lower()),
+            "errorMsg": headers.get(AAMP_HEADER["ERROR_MSG"].lower()),
+            "bodyText": _normalize_body_text(body_text),
+        }
 
     if intent == "card.query":
         return {**base, "bodyText": _normalize_body_text(body_text)}

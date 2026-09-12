@@ -354,7 +354,7 @@ func (s *SmtpSender) SendTask(opts SendTaskOptions) (string, string, error) {
 		taskID = generateID()
 	}
 	priority := firstNonEmpty(opts.Priority, "normal")
-	headers := BuildDispatchHeaders(taskID, priority, opts.ExpiresAt, opts.DispatchContext, opts.ParentTaskID)
+	headers := BuildDispatchHeaders(taskID, priority, opts.ExpiresAt, opts.SessionKey, opts.DispatchContext, opts.ParentTaskID)
 
 	parts := []string{
 		"Task: " + opts.Title,
@@ -432,6 +432,50 @@ func (s *SmtpSender) SendCardQuery(opts SendCardQueryOptions) (string, string, e
 
 func (s *SmtpSender) SendCardResponse(opts SendCardResponseOptions) error {
 	_, err := s.dispatch(opts.To, "[AAMP Card] "+sanitizeHeader(opts.Summary), opts.BodyText, opts.InReplyTo, BuildCardResponseHeaders(opts.TaskID, opts.Summary), nil)
+	return err
+}
+
+func (s *SmtpSender) SendPairRequest(opts SendPairRequestOptions) (string, string, error) {
+	taskID := opts.TaskID
+	if taskID == "" {
+		taskID = generateID()
+	}
+	rules := opts.DispatchContextRules
+	if rules == nil {
+		rules = map[string][]string{}
+	}
+	headers, err := BuildPairRequestHeaders(taskID, opts.PairCode, rules)
+	if err != nil {
+		return "", "", err
+	}
+	validatedPairCode := headers[HeaderPairCode]
+	rulesJSON, _ := json.Marshal(rules)
+	body := strings.Join([]string{
+		"AAMP Pair Request",
+		"",
+		"Pair code: " + validatedPairCode,
+		"Dispatch context rules: " + string(rulesJSON),
+	}, "\n")
+	messageID, err := s.dispatch(opts.To, "[AAMP Pair] Connection request", body, "", headers, nil)
+	return taskID, messageID, err
+}
+
+func (s *SmtpSender) SendPairRespond(opts SendPairRespondOptions) error {
+	headers := BuildPairRespondHeaders(opts.TaskID, opts.Success, opts.Reason)
+	status := "rejected"
+	if opts.Success {
+		status = "completed"
+	}
+	parts := []string{
+		"AAMP Pair Response",
+		"",
+		"Task ID: " + opts.TaskID,
+		"Status: " + status,
+	}
+	if reason := strings.TrimSpace(opts.Reason); reason != "" {
+		parts = append(parts, "", "Reason: "+reason)
+	}
+	_, err := s.dispatch(opts.To, "[AAMP Pair] "+status, strings.Join(parts, "\n"), opts.InReplyTo, headers, nil)
 	return err
 }
 

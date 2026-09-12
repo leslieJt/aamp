@@ -8,10 +8,14 @@ This SDK now includes the same core runtime shape as the Node.js SDK:
 - directory query and profile updates
 - realtime stream create / append / get / close
 - AAMP header builders and parsers
-- SMTP sending for `task.dispatch`, `task.result`, `task.cancel`, `task.help_needed`, `task.stream.opened`, and `card.*`
+- SMTP sending for `task.dispatch`, `task.result`, `task.cancel`, `task.help_needed`, `task.stream.opened`, `pair.request`, `pair.respond`, and `card.*`
 - JMAP WebSocket push reception with polling fallback
 - attachment blob download
 - recent mailbox reconciliation as a safety net
+
+See the repository-wide [SDK capability matrix](../../../docs/SDK_CAPABILITY_MATRIX.md)
+and [shared conformance fixtures](../../../conformance/README.md) for parity
+across Node.js, Python, and Go.
 
 ## Install
 
@@ -54,6 +58,17 @@ func main() {
       log.Fatal(err)
     }
   })
+  client.On("pair.request", func(payload any) {
+    req := payload.(aamp.ParsedMessage)
+    if err := client.SendPairRespond(aamp.SendPairRespondOptions{
+      To:        req.From,
+      TaskID:    req.TaskID,
+      Success:   true,
+      InReplyTo: req.MessageID,
+    }); err != nil {
+      log.Fatal(err)
+    }
+  })
   if err := client.Connect(); err != nil {
     log.Fatal(err)
   }
@@ -88,6 +103,19 @@ func main() {
     log.Fatal(err)
   }
 
+  // Concurrent text.delta appends must pass unique contiguous Sequence values.
+  for index, token := range []string{"A", "B", "C"} {
+    seq := index
+    if _, err := client.AppendStreamEvent(aamp.AppendStreamEventOptions{
+      StreamID: stream.StreamID,
+      Type:     "text.delta",
+      Payload:  map[string]any{"text": token},
+      Sequence: &seq,
+    }); err != nil {
+      log.Fatal(err)
+    }
+  }
+
   if err := client.SendResult(aamp.SendResultOptions{
     To:        "dispatcher@example.com",
     TaskID:    taskID,
@@ -117,9 +145,43 @@ message, err := aamp.ParseAampHeaders(aamp.EmailMetadata{
 })
 ```
 
+## Send a pairing request
+
+```go
+taskID, messageID, err := client.SendPairRequest(aamp.SendPairRequestOptions{
+  To:       "agent@example.com",
+  PairCode: "abc123",
+  DispatchContextRules: map[string][]string{
+    "source": {"feishu"},
+  },
+})
+_ = taskID
+_ = messageID
+_ = err
+```
+
+## Stream append sequencing
+
+`AppendStreamEventOptions.Sequence` controls dispatch order for a stream:
+
+- **Single-threaded / externally serialized callers** may omit `Sequence`. The SDK auto-assigns a monotonic value at enqueue time.
+- **Concurrent callers** on the same stream must pass unique, contiguous sequences (`0, 1, 2, ...`). Dispatch follows sequence order, not lock-acquisition order.
+- Duplicate or already-dispatched sequences return an error.
+- If a required sequence never arrives, pending appends fail after `StreamAppendSequenceTimeout` (default 30s) instead of hanging forever.
+
+```go
+seq := 0
+_, err := client.AppendStreamEvent(aamp.AppendStreamEventOptions{
+  StreamID: streamID,
+  Type:     "text.delta",
+  Payload:  map[string]any{"text": "A"},
+  Sequence: &seq,
+})
+```
+
 ## Run tests
 
 ```bash
-cd packages/sdk-go
+cd packages/sdks/go
 go test ./...
 ```
