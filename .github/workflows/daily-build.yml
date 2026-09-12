@@ -1,6 +1,7 @@
 # Daily project build at 09:00 Asia/Shanghai (UTC+8, no DST).
 # GitHub Actions cron is UTC-only, so 09:00 Shanghai == 01:00 UTC.
 name: Daily build
+# manual-trigger-bump: 2026-09-12T02:03:11Z
 
 on:
   schedule:
